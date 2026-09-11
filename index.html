@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>High-Performance Cognitive Engine</title>
+    <style>
+        body { background: #0a0e17; color: #c9d1d9; font-family: monospace; padding: 12px; margin: 0; font-size: 14px; }
+        .btn { background: #1f6feb; color: #fff; border: none; padding: 12px; border-radius: 6px; width: 100%; margin-bottom: 12px; font-weight: bold; cursor: pointer; }
+        .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+        .console { background: #161b22; border: 1px solid #30363d; padding: 10px; height: 320px; overflow-y: auto; border-radius: 6px; white-space: pre-wrap; word-break: break-all; }
+        .highlight { color: #3fb950; }
+        .warn { color: #f0883e; }
+    </style>
+</head>
+<body>
+
+    <h2 style="color: #bc8cff; font-size: 1.2rem;">Neural Bridge Orchestrator</h2>
+    <button class="btn" id="initBtn" onclick="initSystem()">Boot Subsystems</button>
+    <button class="btn" id="runBtn" onclick="runCycle()" disabled style="background:#238636;">Run Compute Cycle</button>
+    <div class="console" id="terminal">System standing by... Header-free pipeline ready.</div>
+
+    <!-- 1. INLINE WGSL COMPUTE SHADER -->
+    <script type="text/plain" id="wgslShader">
+        const B: u32 = 128u; // Buffer size
+        const D: u32 = 64u;  // Embedding dimension
+
+        @group(0) @binding(0) var<storage, read> context_buffer : array<f32>;
+        @group(0) @binding(1) var<storage, read> query_vector : array<f32>;
+        @group(0) @binding(2) var<storage, read_write> attention_weights : array<f32>;
+
+        @compute @workgroup_size(64)
+        fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
+            let idx = global_id.x;
+            
+            if (idx >= B) {
+                return;
+            }
+
+            var dot_product: f32 = 0.0;
+            
+            for (var i: u32 = 0u; i < D; i = i + 1u) {
+                let context_val = context_buffer[idx * D + i];
+                let query_val = query_vector[i];
+                dot_product = dot_product + (context_val * query_val);
+            }
+            
+            let scaled_attention = dot_product / 8.0;
+            attention_weights[idx] = scaled_attention;
+        }
+    </script>
+
+    <!-- 2. INLINE LOGIC WORKER CODE -->
+    <script type="text/plain" id="workerCode">
+        // ============================================================================
+        // EXECUTION GRAPH DEFS
+        // ============================================================================
+        class ActionNode {
+            constructor(name, actionFunc) {
+                this.name = name;
+                this.actionFunc = actionFunc;
+            }
+            evaluate(context) {
+                self.postMessage({ type: 'LOG', msg: `[ACTION] Executing: ${this.name}` });
+                this.actionFunc(context);
+            }
+        }
+
+        class ConditionNode {
+            constructor(threshold) {
+                this.threshold = threshold;
+            }
+            evaluate(context) {
+                const result = context.maxAttention > this.threshold;
+                self.postMessage({ 
+                    type: 'LOG', 
+                    msg: `[CONDITION] maxAttention (${context.maxAttention.toFixed(4)}) > threshold (${this.threshold.toFixed(4)})? ${result}` 
+                });
+                return result;
+            }
+        }
+
+        class IfNode {
+            constructor(condition, trueBranch, falseBranch) {
+                this.condition = condition;
+                this.trueBranch = trueBranch;
+                this.falseBranch = falseBranch;
+            }
+            evaluate(context) {
+                if (this.condition.evaluate(context)) {
+                    this.trueBranch.evaluate(context);
+                } else {
+                    this.falseBranch.evaluate(context);
+                }
+            }
+        }
+
+        // ============================================================================
+        // LOGIC GRAPH INSTANTIATION
+        // ============================================================================
+        let memoryContext = { maxAttention: 0 };
+
+        let semanticThreshold = new ConditionNode(0.85);
+
+        let highRelevanceAction = new ActionNode("Surface Context to UI", (ctx) => {
+            self.postMessage({ type: 'SURFACE_NODE' });
+        });
+
+        let lowRelevanceAction = new ActionNode("Idle - Adjusting Thresholds", (ctx) => {
+            semanticThreshold.threshold *= 0.98;
+            self.postMessage({ type: 'LOG', msg: `[MUTATION] Lowered semantic threshold to ${semanticThreshold.threshold.toFixed(4)}` });
+        });
+
+        let rootGraph = new IfNode(semanticThreshold, highRelevanceAction, lowRelevanceAction);
+
+        self.onmessage = (e) => {
+            if (e.data.type === 'EVALUATE_CYCLE') {
+                // Parse transferred buffer
+                const attentionView = new Float32Array(e.data.buffer);
+
+                let maxVal = -Infinity;
+                for (let i = 0; i < attentionView.length; i++) {
+                    if (attentionView[i] > maxVal) maxVal = attentionView[i];
+                }
+                
+                memoryContext.maxAttention = maxVal;
+                rootGraph.evaluate(memoryContext);
+            }
+        };
+    </script>
+
+    <!-- 3. MAIN ORCHESTRATOR SCRIPT -->
+    <script>
+        const B = 128;
+        const D = 64;
+        let device, computePipeline, bindGroup, worker;
+        let contextBuffer, queryBuffer, attentionBuffer;
+
+        function log(msg, type = '') {
+            const t = document.getElementById('terminal');
+            const color = type === 'warn' ? 'warn' : type === 'success' ? 'highlight' : '';
+            t.innerHTML += `\n<span class="${color}">[${new Date().toISOString().split('T')[1].slice(0,-1)}] ${msg}</span>`;
+            t.scrollTop = t.scrollHeight;
+        }
+
+        async function initSystem() {
+            try {
+                if (!navigator.gpu) throw new Error("WebGPU is not supported on this browser or hardware.");
+                
+                // 1. Request GPU Adapter & Device
+                const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+                if (!adapter) throw new Error("No GPU adapter found.");
+                device = await adapter.requestDevice();
+                log("WebGPU Device acquired.", "success");
+
+                // 2. Load WGSL Shader
+                const shaderCode = document.getElementById('wgslShader').textContent;
+                const shaderModule = device.createShaderModule({ code: shaderCode });
+
+                // 3. Create GPU Buffers
+                const bufferSizeContext = B * D * 4;
+                const bufferSizeQuery = D * 4;
+                const bufferSizeAttention = B * 4;
+
+                contextBuffer = device.createBuffer({ size: bufferSizeContext, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+                queryBuffer = device.createBuffer({ size: bufferSizeQuery, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+                attentionBuffer = device.createBuffer({ size: bufferSizeAttention, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+
+                // 4. Setup Pipeline
+                computePipeline = device.createComputePipeline({
+                    layout: 'auto',
+                    compute: { module: shaderModule, entryPoint: 'main' }
+                });
+
+                bindGroup = device.createBindGroup({
+                    layout: computePipeline.getBindGroupLayout(0),
+                    entries: [
+                        { binding: 0, resource: { buffer: contextBuffer } },
+                        { binding: 1, resource: { buffer: queryBuffer } },
+                        { binding: 2, resource: { buffer: attentionBuffer } }
+                    ]
+                });
+
+                // 5. Initialize Worker with Blob URL
+                const workerScript = document.getElementById('workerCode').textContent;
+                const blob = new Blob([workerScript], { type: 'application/javascript' });
+                const workerUrl = URL.createObjectURL(blob);
+                
+                worker = new Worker(workerUrl);
+                worker.onmessage = (e) => {
+                    if (e.data.type === 'LOG') log(`[WORKER] ${e.data.msg}`);
+                    if (e.data.type === 'SURFACE_NODE') log(`>> KNOWLEDGE SURFACED BY GRAPH <<`, 'warn');
+                };
+
+                document.getElementById('initBtn').disabled = true;
+                document.getElementById('runBtn').disabled = false;
+                log("All subsystems online. Ready for compute cycles.", "success");
+
+            } catch (err) {
+                log(`Init Failed: ${err.message}`, 'warn');
+            }
+        }
+
+        async function runCycle() {
+            log("--- Initiating GPU Context Pass ---");
+
+            const randomContext = new Float32Array(B * D).map(() => Math.random() - 0.5);
+            const randomQuery = new Float32Array(D).map(() => Math.random() - 0.5);
+
+            device.queue.writeBuffer(contextBuffer, 0, randomContext);
+            device.queue.writeBuffer(queryBuffer, 0, randomQuery);
+
+            const commandEncoder = device.createCommandEncoder();
+            const passEncoder = commandEncoder.beginComputePass();
+            passEncoder.setPipeline(computePipeline);
+            passEncoder.setBindGroup(0, bindGroup);
+            passEncoder.dispatchWorkgroups(Math.ceil(B / 64)); 
+            passEncoder.end();
+
+            const readbackBuffer = device.createBuffer({
+                size: B * 4,
+                usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST
+            });
+            commandEncoder.copyBufferToBuffer(attentionBuffer, 0, readbackBuffer, 0, B * 4);
+            
+            device.queue.submit([commandEncoder.finish()]);
+
+            await readbackBuffer.mapAsync(GPUMapMode.READ);
+            const gpuData = new Float32Array(readbackBuffer.getMappedRange());
+            
+            // Transfer ownership of array buffer directly to worker (Zero-copy, header-free)
+            const bufferToTransfer = gpuData.slice().buffer;
+            readbackBuffer.unmap();
+
+            log("GPU matrix math complete. Transferring buffer to Logic Worker...");
+            
+            worker.postMessage({ 
+                type: 'EVALUATE_CYCLE', 
+                buffer: bufferToTransfer 
+            }, [bufferToTransfer]);
+        }
+    </script>
+</body>
+</html>
